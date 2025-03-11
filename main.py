@@ -7,50 +7,73 @@ from nba_api.stats.endpoints import playergamelog, commonplayerinfo, LeagueGameF
 from nba_api.stats.static import players
 import time
 
-class MarkovChainPredictor:
+class BasketballMarkovChain:
     def __init__(self, n_states=5):
         self.n_states = n_states
-        self.discretizer = KBinsDiscretizer(n_bins=n_states, encode='ordinal', strategy='quantile')
         self.transition_matrix = None
-        self.state_ranges = None
-        
+        self.state_boundaries = None
+        self.sequence_history = None
+    
+    def _get_state(self, value):
+        """Determine which state a value belongs to"""
+        for i, (lower, upper) in enumerate(self.state_boundaries):
+            if lower <= value <= upper:
+                return i
+        return 0
+    
     def fit(self, sequence):
         """
-        Fit Markov chain transition matrix using the sequence
+        Fit the Markov chain using full 10-game sequence
+        sequence: list of point values from games (most recent first)
         """
-        # Convert sequence into discrete states
-        sequence_array = np.array(sequence).reshape(-1, 1)
-        discrete_states = self.discretizer.fit_transform(sequence_array)
+        self.sequence_history = sequence
         
-        # Calculate state ranges for interpretation
-        self.state_ranges = []
-        bin_edges = self.discretizer.bin_edges_[0]
-        for i in range(len(bin_edges) - 1):
-            self.state_ranges.append((bin_edges[i], bin_edges[i + 1]))
+        # Create state boundaries based on the sequence
+        flat_seq = np.array(sequence)
+        percentiles = np.linspace(0, 100, self.n_states + 1)
+        boundaries = np.percentile(flat_seq, percentiles)
+        self.state_boundaries = [
+            (boundaries[i], boundaries[i+1]) 
+            for i in range(len(boundaries)-1)
+        ]
         
-        # Create transition matrix
+        # Initialize transition matrix
         self.transition_matrix = np.zeros((self.n_states, self.n_states))
         
-        # Count transitions between states
-        for i in range(len(discrete_states) - 1):
-            current_state = int(discrete_states[i])
-            next_state = int(discrete_states[i + 1])
+        # Count transitions between states through the full sequence
+        for i in range(len(sequence) - 1):
+            current_state = self._get_state(sequence[i])
+            next_state = self._get_state(sequence[i + 1])
             self.transition_matrix[current_state][next_state] += 1
         
-        # Convert counts to probabilities
+        # Convert to probabilities
         row_sums = self.transition_matrix.sum(axis=1)
-        self.transition_matrix = np.divide(self.transition_matrix, 
-                                         row_sums[:, np.newaxis], 
-                                         where=row_sums[:, np.newaxis]!=0)
+        for i in range(self.n_states):
+            if row_sums[i] > 0:
+                self.transition_matrix[i] = self.transition_matrix[i] / row_sums[i]
+    
+    def predict_next(self, n_simulations=1000):
+        """
+        Predict next value using the current sequence
+        """
+        current_state = self._get_state(self.sequence_history[0])  # Most recent game
+        predictions = []
         
-    def predict_next_state(self, current_value):
-        """
-        Predict next state using Markov chain
-        """
-        current_state = int(self.discretizer.transform([[current_value]])[0])
-        next_state = np.random.choice(self.n_states, p=self.transition_matrix[current_state])
-        return np.random.uniform(self.state_ranges[next_state][0],
-                               self.state_ranges[next_state][1])
+        for _ in range(n_simulations):
+            next_state = np.random.choice(self.n_states, p=self.transition_matrix[current_state])
+            lower, upper = self.state_boundaries[next_state]
+            predicted_value = np.random.uniform(lower, upper)
+            predictions.append(predicted_value)
+        
+        return predictions
+
+    def get_state_analysis(self):
+        """Analyze the states and transitions"""
+        analysis = []
+        for i, (lower, upper) in enumerate(self.state_boundaries):
+            games_in_state = sum(1 for p in self.sequence_history if lower <= p <= upper)
+            analysis.append(f"State {i}: {lower:.1f}-{upper:.1f} points ({games_in_state} games)")
+        return analysis
 
 def evaluate_over_under(points_chain, minutes_chain, fg_chain, three_chain,
                        current_points, current_minutes, current_fg, current_three,
@@ -156,36 +179,23 @@ if __name__ == "__main__":
     player_name = input("Enter player name: ")
     print("\nEnter 10 games of stats (most recent first)")
     print("Format: MIN FG FG% 3PT 3P% FT FT% REB AST BLK STL PF TO PTS")
-    print("Example: 40 7-19 36.8 1-7 14.3 2-4 50.0 4 2 1 1 2 2 17")
     
-    games_data = []
+    # Collect exactly 10 games
+    points_data = []
     for i in range(10):
         while True:
             try:
                 line = input(f"Game {i+1}: ")
-                game_stats = parse_stat_line(line)
-                games_data.append(game_stats)
+                stats = line.strip().split()
+                points = int(stats[13])
+                points_data.append(points)
                 break
-            except Exception as e:
-                print(f"Error parsing line. Please ensure format matches example.")
+            except:
+                print("Error: Please enter valid stats")
     
-    # Extract sequences for the model
-    minutes = [game['MIN'] for game in games_data]
-    fg_pcts = [game['FG%'] for game in games_data]
-    three_pcts = [game['3P%'] for game in games_data]
-    points = [game['PTS'] for game in games_data]
-    
-    # Create separate Markov chains for each metric
-    points_chain = MarkovChainPredictor(n_states=5)
-    minutes_chain = MarkovChainPredictor(n_states=5)
-    fg_chain = MarkovChainPredictor(n_states=5)
-    three_chain = MarkovChainPredictor(n_states=5)
-    
-    # Fit each chain
-    points_chain.fit(points)
-    minutes_chain.fit(minutes)
-    fg_chain.fit(fg_pcts)
-    three_chain.fit(three_pcts)
+    # Initialize and fit Markov chain with full 10-game sequence
+    markov_chain = BasketballMarkovChain(n_states=5)
+    markov_chain.fit(points_data)
     
     # Get over/under line
     while True:
@@ -195,36 +205,62 @@ if __name__ == "__main__":
         except ValueError:
             print("Please enter a valid number")
     
-    # Calculate probability using Markov chains
-    over_prob = evaluate_over_under(
-        points_chain, minutes_chain, fg_chain, three_chain,
-        points[0], minutes[0], fg_pcts[0], three_pcts[0],
-        over_under_line
-    )
+    # Get number of simulations
+    n_sims = int(input("Enter number of simulations to run (recommended 1000-10000): "))
     
-    print(f"\nPrediction for {player_name}:")
-    print(f"Last game: {points[0]} points in {minutes[0]} minutes")
-    print(f"Last game shooting: FG: {fg_pcts[0]}%, 3P: {three_pcts[0]}%")
-    print(f"\nOver/Under line: {over_under_line}")
-    print(f"Probability of Over: {over_prob:.2%}")
-    print(f"Probability of Under: {(1-over_prob):.2%}")
+    # Make predictions
+    predictions = markov_chain.predict_next(n_sims)
     
-    # Get user's bet choice
-    while True:
-        choice = input("\nWould you like to bet Over or Under? (O/U): ").upper()
-        if choice in ['O', 'U']:
-            break
-        print("Please enter 'O' for Over or 'U' for Under")
+    # Calculate probabilities
+    over_count = sum(1 for p in predictions if p > over_under_line)
+    over_prob = over_count / len(predictions)
     
-    probability = over_prob if choice == 'O' else (1-over_prob)
-    bet_type = "OVER" if choice == 'O' else "UNDER"
+    print(f"\nMarkov Chain Analysis for {player_name}")
+    print("\nLast 10 games (most recent first):")
+    for i, points in enumerate(points_data):
+        print(f"Game {i+1}: {points} points")
     
-    print(f"\nYou chose {bet_type} {over_under_line}")
-    print(f"Model probability for your bet: {probability:.2%}")
+    print("\nState Analysis:")
+    for state_info in markov_chain.get_state_analysis():
+        print(state_info)
     
-    if probability > 0.55:
-        print("Model suggests this might be a good bet!")
-    elif probability < 0.45:
-        print("Model suggests this might not be a good bet.")
+    print("\nTransition Matrix:")
+    for i in range(markov_chain.n_states):
+        print(f"State {i} transitions: {markov_chain.transition_matrix[i]}")
+    
+    print(f"\nPrediction Summary:")
+    print(f"Average predicted points: {np.mean(predictions):.1f}")
+    print(f"Median predicted points: {np.median(predictions):.1f}")
+    print(f"Standard deviation: {np.std(predictions):.1f}")
+    
+    print(f"\nOver/Under {over_under_line}:")
+    print(f"Over probability: {over_prob:.2%}")
+    print(f"Under probability: {1-over_prob:.2%}")
+    
+    # Calculate trend
+    recent_trend = np.mean(points_data[:3]) - np.mean(points_data[3:6])
+    print(f"\nRecent Trend: {recent_trend:+.1f} points (comparing last 3 vs previous 3 games)")
+    
+    # Confidence calculation based on prediction consistency and state transitions
+    confidence = 1 - (np.std(predictions) / np.mean(predictions))
+    print(f"Prediction confidence: {confidence:.1%}")
+    
+    # Enhanced recommendation system
+    print("\nRecommendation:")
+    if confidence > 0.7:
+        if over_prob > 0.6:
+            print(f"Strong OVER ({over_prob:.1%} probability)")
+            print(f"Confidence is high ({confidence:.1%})")
+            if recent_trend > 0:
+                print("Positive scoring trend supports this prediction")
+        elif over_prob < 0.4:
+            print(f"Strong UNDER ({1-over_prob:.1%} probability)")
+            print(f"Confidence is high ({confidence:.1%})")
+            if recent_trend < 0:
+                print("Negative scoring trend supports this prediction")
+        else:
+            print("No strong recommendation despite high confidence")
     else:
-        print("Model suggests this is a close call.")
+        print(f"Low confidence prediction ({confidence:.1%}) - proceed with caution")
+        print(f"Over probability: {over_prob:.1%}")
+        print(f"Recent trend: {recent_trend:+.1f} points")
